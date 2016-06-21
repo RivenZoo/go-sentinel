@@ -95,6 +95,8 @@ func NewSentinel(addrs []string, masterName string) *Sentinel {
 		MasterName: masterName,
 		Dial: func(addr string) (redis.Conn, error) {
 			timeout := defaultTimeout * time.Second
+			// if read timeout set to 0, it will hang on
+			// conn Close after time.Sleep call
 			c, err := redis.DialTimeout("tcp", addr,
 				timeout, timeout, timeout)
 			if err != nil {

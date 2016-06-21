@@ -41,6 +41,7 @@ func TestSentinel(t *testing.T) {
 		}
 		fmt.Println("watch exit")
 	}()
+	// if read timeout is 0, ms.Close will hang on after time.Sleep
 	time.Sleep(20 * time.Second)
 	fmt.Println("close")
 	ms.Close()
