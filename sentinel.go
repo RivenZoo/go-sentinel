@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"bytes"
+
+	log "github.com/cihub/seelog"
 	"github.com/garyburd/redigo/redis"
 )
 
@@ -56,6 +59,12 @@ import (
 //  		},
 //  	}
 //  }
+
+const (
+	switchMasterChannel = "+switch-master"
+	defaultTimeout      = 10 // seconds
+)
+
 type Sentinel struct {
 	// Addrs is a slice with known Sentinel addresses.
 	Addrs []string
@@ -78,6 +87,103 @@ type Sentinel struct {
 	mu    sync.RWMutex
 	pools map[string]*redis.Pool
 	addr  string
+}
+
+func NewSentinel(addrs []string, masterName string) *Sentinel {
+	return &Sentinel{
+		Addrs:      addrs,
+		MasterName: masterName,
+		Dial: func(addr string) (redis.Conn, error) {
+			timeout := defaultTimeout * time.Second
+			c, err := redis.DialTimeout("tcp", addr,
+				timeout, timeout, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+	}
+}
+
+type SentinelPool struct {
+	sntl          *Sentinel
+	masterWatcher *MasterSentinel
+	pool          *redis.Pool
+	mu            *sync.RWMutex
+	curAddr       string
+	closed        bool
+}
+
+func NewSentinelPool(addrs []string, masterName string) *SentinelPool {
+	sp := &SentinelPool{
+		sntl: NewSentinel(addrs, masterName),
+		mu:   &sync.RWMutex{},
+	}
+	var err error
+	sp.curAddr, err = sp.sntl.MasterAddr()
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		for {
+			sp.mu.RLock()
+			if sp.closed {
+				log.Debug("sentinel pool closed")
+				break
+			}
+			sp.mu.RUnlock()
+			ms, err := sp.sntl.MasterSwitch()
+			if err != nil {
+				log.Errorf("subscript master switch error:%v",
+					err)
+			}
+			w, err := ms.Watch()
+			if err != nil {
+				log.Errorf("watch channel error:%v",
+					err)
+			}
+			sp.mu.Lock()
+			sp.masterWatcher = ms
+			sp.mu.Unlock()
+			for addr := range w {
+				sp.mu.Lock()
+				sp.curAddr = addr
+				sp.mu.Unlock()
+			}
+			ms.Close()
+		}
+	}()
+	sp.pool = &redis.Pool{
+		MaxIdle:     16,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			sp.mu.RLock()
+			addr := sp.curAddr
+			sp.mu.RUnlock()
+			timeout := defaultTimeout * time.Second
+			c, err := redis.DialTimeout("tcp", addr,
+				timeout, timeout, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+	}
+	return sp
+}
+
+// redis.Conn must Close after use
+func (p *SentinelPool) Get() redis.Conn {
+	return p.pool.Get()
+}
+
+func (p *SentinelPool) Close() {
+	p.mu.Lock()
+	p.closed = true
+	p.pool.Close()
+	p.masterWatcher.Close()
+	p.sntl.Close()
+	p.mu.Unlock()
 }
 
 // NoSentinelsAvailable is returned when all sentinels in the list are exhausted
@@ -236,6 +342,84 @@ func (s *Sentinel) doUntilSuccess(f func(redis.Conn) (interface{}, error)) (inte
 	}
 
 	return nil, NoSentinelsAvailable{lastError: lastErr}
+}
+
+func (s *Sentinel) subscriptMasterSwitch() (redis.PubSubConn, error) {
+	s.mu.RLock()
+	addrs := s.Addrs
+	s.mu.RUnlock()
+	var lastErr error
+
+	for _, addr := range addrs {
+		conn := s.get(addr)
+		sub := redis.PubSubConn{Conn: conn}
+		err := sub.Subscribe(switchMasterChannel)
+		if err != nil {
+			lastErr = err
+			s.mu.Lock()
+			pool, ok := s.pools[addr]
+			if ok {
+				pool.Close()
+				delete(s.pools, addr)
+			}
+			s.putToBottom(addr)
+			s.mu.Unlock()
+			continue
+		}
+		s.putToTop(addr)
+		return sub, nil
+	}
+
+	return redis.PubSubConn{nil}, NoSentinelsAvailable{lastError: lastErr}
+}
+
+type MasterSentinel struct {
+	masterName string
+	pubsub     redis.PubSubConn
+}
+
+func (ms *MasterSentinel) Close() error {
+	return ms.pubsub.Close()
+}
+
+func (ms *MasterSentinel) Watch() (<-chan string, error) {
+	ch := make(chan string)
+	go func() {
+		for {
+			switch reply := ms.pubsub.Receive().(type) {
+			case redis.Message:
+				p := bytes.Split(reply.Data, []byte(" "))
+				if len(p) != 5 || string(p[0]) != ms.masterName {
+					continue
+				}
+				addr := fmt.Sprintf("%s:%s", string(p[3]), string(p[4]))
+				ch <- addr
+			case error:
+				log.Errorf("channel receive error:%v", reply)
+				close(ch)
+				return
+			case redis.Subscription:
+				if reply.Channel == switchMasterChannel &&
+					reply.Kind == "unsubscribe" {
+					log.Debugf("unsubscribe switch-master")
+					close(ch)
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
+func (s *Sentinel) MasterSwitch() (*MasterSentinel, error) {
+	sub, err := s.subscriptMasterSwitch()
+	if err != nil {
+		return nil, err
+	}
+	return &MasterSentinel{
+		pubsub:     sub,
+		masterName: s.MasterName,
+	}, nil
 }
 
 // MasterAddr returns an address of current Redis master instance.
