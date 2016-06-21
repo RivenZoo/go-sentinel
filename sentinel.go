@@ -177,6 +177,13 @@ func (p *SentinelPool) Get() redis.Conn {
 	return p.pool.Get()
 }
 
+func (p *SentinelPool) MasterAddr() string {
+	p.mu.RLock()
+	addr := p.curAddr
+	p.mu.RUnlock()
+	return addr
+}
+
 func (p *SentinelPool) Close() {
 	p.mu.Lock()
 	p.closed = true
