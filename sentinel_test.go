@@ -48,7 +48,7 @@ func TestSentinel(t *testing.T) {
 }
 
 func TestSentinelPool(t *testing.T) {
-	sp := NewSentinelPool([]string{"127.0.0.1:26379"}, "mymaster")
+	sp := NewSentinelPool([]string{"127.0.0.1:26379"}, "mymaster", 0, "")
 	for i := 0; i < 30; i++ {
 		conn := sp.Get()
 		if conn == nil {

@@ -114,7 +114,8 @@ type SentinelPool struct {
 	closed        bool
 }
 
-func NewSentinelPool(addrs []string, masterName string) *SentinelPool {
+func NewSentinelPool(addrs []string, masterName string,
+	defaultDb int, password string) *SentinelPool {
 	sp := &SentinelPool{
 		sntl: NewSentinel(addrs, masterName),
 		mu:   &sync.RWMutex{},
@@ -165,6 +166,17 @@ func NewSentinelPool(addrs []string, masterName string) *SentinelPool {
 				timeout, timeout, timeout)
 			if err != nil {
 				return nil, err
+			}
+			if password != "" {
+				if _, err := c.Do("AUTH", password); err != nil {
+					c.Close()
+					return nil, err
+				}
+			}
+			_, selectErr := c.Do("SELECT", defaultDb)
+			if selectErr != nil {
+				c.Close()
+				return nil, selectErr
 			}
 			return c, nil
 		},
