@@ -95,10 +95,9 @@ func NewSentinel(addrs []string, masterName string) *Sentinel {
 		MasterName: masterName,
 		Dial: func(addr string) (redis.Conn, error) {
 			timeout := defaultTimeout * time.Second
-			// if read timeout set to 0, it will hang on
-			// conn Close after time.Sleep call
+			// read timeout set to 0 to wait sentinel notify
 			c, err := redis.DialTimeout("tcp", addr,
-				timeout, timeout, timeout)
+				timeout, 0, timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -400,6 +399,8 @@ type MasterSentinel struct {
 }
 
 func (ms *MasterSentinel) Close() error {
+	// must Unsubscribe before Close, otherwise Close will block
+	ms.pubsub.Unsubscribe(switchMasterChannel)
 	return ms.pubsub.Close()
 }
 
@@ -421,7 +422,7 @@ func (ms *MasterSentinel) Watch() (<-chan string, error) {
 				return
 			case redis.Subscription:
 				if reply.Channel == switchMasterChannel &&
-					reply.Kind == "unsubscribe" {
+					reply.Kind == "unsubscribe" && reply.Count == 0 {
 					log.Debugf("unsubscribe switch-master")
 					close(ch)
 					return
