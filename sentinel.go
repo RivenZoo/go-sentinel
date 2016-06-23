@@ -158,6 +158,7 @@ func (sp *SentinelPool) _monitorMaster() {
 			sp.curAddr = addr
 			sp.mu.Unlock()
 		}
+		// close in case error occured
 		ms.Close()
 	}
 }
@@ -403,13 +404,23 @@ func (s *Sentinel) subscriptMasterSwitch() (redis.PubSubConn, error) {
 type MasterSentinel struct {
 	masterName string
 	pubsub     redis.PubSubConn
-	closed     chan struct{}
+	mu         *sync.Mutex
+	closed     bool
+	watchExit  chan struct{}
 }
 
 func (ms *MasterSentinel) Close() error {
-	// must Unsubscribe before Close, otherwise Close will block
+	// protect pubsub.Unsubscribe to prevent concurrently called
+	ms.mu.Lock()
+	// prevent repeatedly call
+	if ms.closed {
+		return nil
+	}
 	ms.pubsub.Unsubscribe(switchMasterChannel)
-	<-ms.closed
+	ms.closed = true
+	// wait watch rontine exit
+	<-ms.watchExit
+	ms.mu.Unlock()
 	return ms.pubsub.Close()
 }
 
@@ -417,7 +428,7 @@ func (ms *MasterSentinel) Watch() (<-chan string, error) {
 	ch := make(chan string)
 	go func() {
 		defer func() {
-			close(ms.closed)
+			close(ms.watchExit)
 		}()
 		for {
 			switch reply := ms.pubsub.Receive().(type) {
@@ -453,7 +464,9 @@ func (s *Sentinel) MasterSwitch() (*MasterSentinel, error) {
 	return &MasterSentinel{
 		pubsub:     sub,
 		masterName: s.MasterName,
-		closed:     make(chan struct{}),
+		closed:     false,
+		mu:         &sync.Mutex{},
+		watchExit:  make(chan struct{}),
 	}, nil
 }
 
