@@ -126,35 +126,43 @@ func NewSentinelPool(addrs []string, masterName string,
 	if err != nil {
 		panic(err)
 	}
-	go func() {
-		for {
-			sp.mu.RLock()
-			if sp.closed {
-				log.Debug("sentinel pool closed")
-				break
-			}
-			sp.mu.RUnlock()
-			ms, err := sp.sntl.MasterSwitch()
-			if err != nil {
-				log.Errorf("subscript master switch error:%v",
-					err)
-			}
-			w, err := ms.Watch()
-			if err != nil {
-				log.Errorf("watch channel error:%v",
-					err)
-			}
-			sp.mu.Lock()
-			sp.masterWatcher = ms
-			sp.mu.Unlock()
-			for addr := range w {
-				sp.mu.Lock()
-				sp.curAddr = addr
-				sp.mu.Unlock()
-			}
-			ms.Close()
+	go sp._monitorMaster()
+
+	sp._initPool(defaultDb, password)
+	return sp
+}
+
+func (sp *SentinelPool) _monitorMaster() {
+	for {
+		sp.mu.RLock()
+		if sp.closed {
+			log.Debug("sentinel pool closed")
+			break
 		}
-	}()
+		sp.mu.RUnlock()
+		ms, err := sp.sntl.MasterSwitch()
+		if err != nil {
+			log.Errorf("subscript master switch error:%v",
+				err)
+		}
+		w, err := ms.Watch()
+		if err != nil {
+			log.Errorf("watch channel error:%v",
+				err)
+		}
+		sp.mu.Lock()
+		sp.masterWatcher = ms
+		sp.mu.Unlock()
+		for addr := range w {
+			sp.mu.Lock()
+			sp.curAddr = addr
+			sp.mu.Unlock()
+		}
+		ms.Close()
+	}
+}
+
+func (sp *SentinelPool) _initPool(defaultDb int, password string) {
 	sp.pool = &redis.Pool{
 		MaxIdle:     16,
 		IdleTimeout: 240 * time.Second,
@@ -182,7 +190,6 @@ func NewSentinelPool(addrs []string, masterName string,
 			return c, nil
 		},
 	}
-	return sp
 }
 
 // redis.Conn must Close after use
@@ -396,17 +403,22 @@ func (s *Sentinel) subscriptMasterSwitch() (redis.PubSubConn, error) {
 type MasterSentinel struct {
 	masterName string
 	pubsub     redis.PubSubConn
+	closed     chan struct{}
 }
 
 func (ms *MasterSentinel) Close() error {
 	// must Unsubscribe before Close, otherwise Close will block
 	ms.pubsub.Unsubscribe(switchMasterChannel)
+	<-ms.closed
 	return ms.pubsub.Close()
 }
 
 func (ms *MasterSentinel) Watch() (<-chan string, error) {
 	ch := make(chan string)
 	go func() {
+		defer func() {
+			close(ms.closed)
+		}()
 		for {
 			switch reply := ms.pubsub.Receive().(type) {
 			case redis.Message:
@@ -441,6 +453,7 @@ func (s *Sentinel) MasterSwitch() (*MasterSentinel, error) {
 	return &MasterSentinel{
 		pubsub:     sub,
 		masterName: s.MasterName,
+		closed:     make(chan struct{}),
 	}, nil
 }
 
